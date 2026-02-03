@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local Ollama models (se você decidir mapear o volume localmente)
+.ollama/
+
+# Variáveis de ambiente (Segurança)
+.env
+
+# Banco de dados local (Docker volumes persistentes)
+postgres_data/
+
+# Documentos de teste
+data/*.pdf
