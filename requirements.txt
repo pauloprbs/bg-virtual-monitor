@@ -1,0 +1,28 @@
+# Web
+fastapi==0.110.0
+uvicorn==0.27.1
+python-multipart==0.0.9
+
+# LangChain (stack 1.x coerente)
+langchain==1.2.8
+langchain-core==1.2.8
+langchain-community==0.4.1
+langchain-text-splitters==1.1.0
+langgraph==1.0.7
+
+# LLM Providers
+langchain-groq==1.1.2
+langchain-ollama==1.0.1
+
+# Database & Vectors
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.28
+pgvector==0.2.5
+
+# Docs
+pymupdf==1.23.26
+
+# Utils
+python-dotenv==1.0.1
+pydantic-settings>=2.10.1  # Alterado aqui
+requests>=2.32.5

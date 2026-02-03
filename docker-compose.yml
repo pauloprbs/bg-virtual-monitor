@@ -1,6 +1,16 @@
-version: '3.8'
-
 services:
+  app:
+    build: .
+    container_name: bg_virtual_monitor_app
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - 8000:8000
+    env_file:
+      - .env
+    volumes:
+      - .:/app
   db:
     image: pgvector/pgvector:pg16
     container_name: postgres
@@ -13,7 +23,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DB}
     healthcheck:
-      test: ["CMD_SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -31,5 +41,6 @@ services:
     command: -c "/bin/ollama serve & sleep 10 && ollama pull bge-m3 && tail -f /dev/null"
 
 volumes:
+  bg_virtual_monitor_app:
   postgres_data:
   ollama_storage:
