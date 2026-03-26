@@ -1,8 +1,17 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import text
-from app.database.database import engine, Base
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from app.database.database import engine, Base, get_db
 from app.database import models 
+from app.services.chat_service import get_answer
+
+# Modelo para a requisição de chat
+class ChatRequest(BaseModel):
+    game_title: str
+    question: str
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -13,10 +22,10 @@ async def lifespan(app: FastAPI):
         # 2. Cria as tabelas baseadas nos modelos SQLAlchemy
         Base.metadata.create_all(bind=conn)
     
-    yield  # Aqui a API "roda". O código depois do yield só executa no shutdown.
+    yield  # A API fica online aqui
     
-    # --- Lógica de Encerramento (Shutdown) se necessário ---
-    # engine.dispose() # Exemplo
+    # --- Lógica de Encerramento (Shutdown) ---
+    engine.dispose()
 
 app = FastAPI(
     title="BG Virtual Monitor",
@@ -32,3 +41,21 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+@app.post("/ask")
+async def ask_question(request: ChatRequest, db: Session = Depends(get_db)):
+    """
+    Endpoint para perguntar sobre as regras de um jogo específico.
+    Exemplo de game_title: 'Brass Birmingham' ou 'Catan'
+    """
+    try:
+        answer = get_answer(request.question, request.game_title, db)
+        return {
+            "game": request.game_title,
+            "question": request.question,
+            "answer": answer
+        }
+    except Exception as e:
+        # Log do erro para facilitar o debug se o Groq ou Ollama falharem
+        print(f"Erro no processamento do chat: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao processar a pergunta.")
