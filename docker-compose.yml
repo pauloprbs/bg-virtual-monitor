@@ -11,6 +11,18 @@ services:
       - .env
     volumes:
       - .:/app
+
+  frontend:
+    build: .
+    container_name: bg_virtual_monitor_frontend
+    ports:
+      - "8501:8501"
+    command: ["streamlit", "run", "app/frontend.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    environment:
+      - BACKEND_URL=http://app:8000
+    depends_on:
+      - app
+
   db:
     image: pgvector/pgvector:pg16
     container_name: postgres

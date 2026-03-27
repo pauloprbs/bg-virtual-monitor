@@ -16,11 +16,8 @@ llm = ChatGroq(
 )
 
 def get_answer(question: str, game_title: str, db: Session):
-    # 1. Gerar o embedding da pergunta
     query_vector = embeddings.embed_query(question)
     
-    # 2. Busca vetorial filtrada por jogo
-    # JOIN com a tabela 'games' para garantir que os trechos sejam do jogo certo
     sql = text("""
         SELECT c.content, c.page_number 
         FROM game_chunks c
@@ -30,28 +27,20 @@ def get_answer(question: str, game_title: str, db: Session):
         LIMIT 4
     """)
     
-    # Executa a busca passando o título do jogo
-    results = db.execute(sql, {
-        "vector": str(query_vector),
-        "title": f"%{game_title}%" 
-    }).fetchall()
+    results = db.execute(sql, {"vector": str(query_vector), "title": f"%{game_title}%"}).fetchall()
     
-    # Validação: Se o jogo não existir ou não tiver chunks
     if not results:
-        return f"Desculpe, não encontrei o manual do jogo '{game_title}' no meu sistema."
+        return "Lamentavelmente, não encontrei informações sobre este jogo.", []
 
-    # 3. Montagem do contexto (Limpando o ruídos, como duplicações nos chunks)
-    context_parts = []
-    for i, r in enumerate(results):
-        # Criamos uma referência clara que a IA pode citar
-        content = r.content.strip().replace('\xa0', ' ')
-        context_parts.append(f"--- TRECHO {i+1} (Página {r.page_number}) ---\n{content}")
+    # Criar a lista de fontes para o Frontend ---
+    sources = [f"[Página {r.page_number}]: {r.content.strip()[:200]}..." for r in results]
     
+    # Montagem do contexto para o LLM (com o detalhamento que já tínhamos)
+    context_parts = [f"--- TRECHO (Página {r.page_number}) ---\n{r.content.strip()}" for r in results]
     context = "\n\n".join(context_parts)
 
-    # 4. Prompt Citando as fontes (Grounding)
     system_prompt = (
-        "Você é um monitor especialista no jogo de tabuleiro {game_title}. " # Mantemos como variável
+        "Você é um monitor especialista no jogo de tabuleiro {game_title}. "
         "Sua tarefa é responder perguntas dos jogadores usando APENAS os trechos do manual fornecidos abaixo. "
         "\n\nREGRAS CRÍTICAS:\n"
         "1. CITAÇÃO OBRIGATÓRIA: Para cada regra mencionada, você DEVE indicar a página entre parênteses, ex: (Pág. 10).\n"
@@ -66,13 +55,11 @@ def get_answer(question: str, game_title: str, db: Session):
         ("human", "{question}"),
     ])
 
-    # 5. Chain e Invocação
     chain = prompt | llm
-    
     response = chain.invoke({
         "context": context, 
         "question": question, 
         "game_title": game_title
     })
     
-    return response.content
+    return response.content, sources
