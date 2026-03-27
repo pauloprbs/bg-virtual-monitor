@@ -59,3 +59,10 @@ async def ask_question(request: ChatRequest, db: Session = Depends(get_db)):
         # Log do erro para facilitar o debug se o Groq ou Ollama falharem
         print(f"Erro no processamento do chat: {e}")
         raise HTTPException(status_code=500, detail="Erro interno ao processar a pergunta.")
+    
+@app.get("/games")
+async def list_games(db: Session = Depends(get_db)):
+    # Busca todos os títulos de jogos cadastrados
+    games = db.query(models.Game.title).all()
+    # Retorna apenas uma lista de strings: ["Brass Birmingham", "Catan"]
+    return [g.title for g in games]
