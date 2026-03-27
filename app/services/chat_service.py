@@ -41,22 +41,38 @@ def get_answer(question: str, game_title: str, db: Session):
         return f"Desculpe, não encontrei o manual do jogo '{game_title}' no meu sistema."
 
     # 3. Montagem do contexto (Limpando o ruídos, como duplicações nos chunks)
-    context_parts = [f"[Pág {r.page_number}]: {r.content.strip()}" for r in results]
+    context_parts = []
+    for i, r in enumerate(results):
+        # Criamos uma referência clara que a IA pode citar
+        content = r.content.strip().replace('\xa0', ' ')
+        context_parts.append(f"--- TRECHO {i+1} (Página {r.page_number}) ---\n{content}")
+    
     context = "\n\n".join(context_parts)
 
-    # 4. Prompt e LLM (O Groq vai "limpar" as repetições de texto para você)
+    # 4. Prompt Citando as fontes (Grounding)
     system_prompt = (
-        f"Você é um monitor especialista no jogo {game_title}. "
-        "Use os trechos do manual fornecidos para responder. Ignore repetições de texto no contexto."
+        "Você é um monitor especialista no jogo de tabuleiro {game_title}. " # Mantemos como variável
+        "Sua tarefa é responder perguntas dos jogadores usando APENAS os trechos do manual fornecidos abaixo. "
+        "\n\nREGRAS CRÍTICAS:\n"
+        "1. CITAÇÃO OBRIGATÓRIA: Para cada regra mencionada, você DEVE indicar a página entre parênteses, ex: (Pág. 10).\n"
+        "2. FIDELIDADE: Não invente regras. Se a informação não estiver nos trechos, responda: 'Lamentavelmente, não encontrei essa regra específica no manual de {game_title}.'\n"
+        "3. LIMPEZA: Ignore linhas repetidas ou erros de formatação nos trechos.\n"
+        "4. ESTILO: Seja direto, mas educado."
     )
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        ("system", "CONTEXTO:\n{context}"),
+        ("system", "TRECHOS DO MANUAL RECUPERADOS:\n{context}"),
         ("human", "{question}"),
     ])
 
+    # 5. Chain e Invocação
     chain = prompt | llm
-    response = chain.invoke({"context": context, "question": question})
+    
+    response = chain.invoke({
+        "context": context, 
+        "question": question, 
+        "game_title": game_title
+    })
     
     return response.content
