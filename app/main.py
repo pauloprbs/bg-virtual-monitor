@@ -49,11 +49,12 @@ async def ask_question(request: ChatRequest, db: Session = Depends(get_db)):
     Exemplo de game_title: 'Brass Birmingham' ou 'Catan'
     """
     try:
-        answer = get_answer(request.question, request.game_title, db)
+        answer, sources = get_answer(request.question, request.game_title, db)
         return {
             "game": request.game_title,
             "question": request.question,
-            "answer": answer
+            "answer": answer,
+            "sources": sources
         }
     except Exception as e:
         # Log do erro para facilitar o debug se o Groq ou Ollama falharem
