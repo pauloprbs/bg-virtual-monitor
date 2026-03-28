@@ -1,4 +1,5 @@
 import os
+import json
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from langchain_ollama import OllamaEmbeddings
@@ -15,54 +16,119 @@ llm = ChatGroq(
     groq_api_key=os.getenv("GROQ_API_KEY")
 )
 
-def get_answer(question: str, game_title: str, db: Session):
-    query_vector = embeddings.embed_query(question)
+# Constante do RRF — valor padrão da literatura é 60
+RRF_K = 60
 
+
+def expand_query(question: str, game_title: str) -> list[str]:
+    """Usa o LLM para gerar 3 variações da pergunta original."""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Você é um assistente que ajuda a melhorar buscas em manuais do jogo de tabuleiro {game_title}. "
+         "Dado uma pergunta de um jogador, gere exatamente 3 variações diferentes dela, "
+         "usando vocabulário alternativo que possa aparecer no manual. "
+         "Responda APENAS com um JSON array de strings, sem explicações. "
+         'Exemplo: ["variação 1", "variação 2", "variação 3"]'),
+        ("human", "{question}")
+    ])
+    chain = prompt | llm
+    response = chain.invoke({"question": question, "game_title": game_title})
+
+    try:
+        variations = json.loads(response.content)
+        if isinstance(variations, list):
+            return [str(v) for v in variations[:3]]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Fallback: retorna lista vazia, a busca original ainda será usada
+    return []
+
+
+def search_chunks(query: str, game_title: str, db: Session, limit: int = 6) -> list[tuple]:
+    """Faz uma busca vetorial e retorna lista de (content, page_number)."""
+    query_vector = embeddings.embed_query(query)
     sql = text("""
         SELECT c.content, c.page_number
         FROM game_chunks c
         JOIN games g ON c.game_id = g.id
         WHERE g.title ILIKE :title
         ORDER BY c.embedding <=> :vector
-        LIMIT 6
+        LIMIT :limit
     """)
+    rows = db.execute(sql, {
+        "vector": str(query_vector),
+        "title": f"%{game_title}%",
+        "limit": limit
+    }).fetchall()
+    return [(r.content, r.page_number) for r in rows]
 
-    results = db.execute(sql, {"vector": str(query_vector), "title": f"%{game_title}%"}).fetchall()
 
-    if not results:
+def rrf_fusion(ranked_lists: list[list[tuple]], k: int = RRF_K) -> list[tuple]:
+    """
+    Reciprocal Rank Fusion.
+    Cada lista é uma sequência ordenada de (content, page_number).
+    Retorna lista fundida e reordenada por score RRF decrescente.
+    """
+    scores: dict[str, float] = {}
+    # Guarda o conteúdo original para recuperar depois
+    chunk_data: dict[str, tuple] = {}
+
+    for ranked_list in ranked_lists:
+        for position, (content, page_number) in enumerate(ranked_list):
+            # Fingerprint pelo conteúdo limpo para deduplicar entre listas
+            texto_limpo = super_clean(content)
+            fingerprint = " ".join(texto_limpo.split()[:20])
+
+            # Acumula score RRF
+            scores[fingerprint] = scores.get(fingerprint, 0.0) + 1.0 / (k + position + 1)
+
+            # Registra dados do chunk (primeira ocorrência ganha)
+            if fingerprint not in chunk_data:
+                chunk_data[fingerprint] = (page_number, texto_limpo)
+
+    # Ordena por score RRF decrescente
+    sorted_fingerprints = sorted(scores, key=lambda fp: scores[fp], reverse=True)
+    return [chunk_data[fp] for fp in sorted_fingerprints]
+
+
+def get_answer(question: str, game_title: str, db: Session):
+    # 1. Busca original
+    original_results = search_chunks(question, game_title, db)
+
+    if not original_results:
         return "Lamentavelmente, não encontrei informações sobre este jogo no manual.", []
 
-    # 1. Limpa e deduplica
-    seen_texts = set()
-    cleaned_results = []
-    for r in results:
-        texto_limpo = super_clean(r.content)
-        # Fingerprint pelas primeiras 20 palavras — mais robusto que slice de chars
-        fingerprint = " ".join(texto_limpo.split()[:20])
-        if fingerprint in seen_texts:
-            continue
-        seen_texts.add(fingerprint)
-        cleaned_results.append((r.page_number, texto_limpo))
+    # 2. Gera variações e faz buscas adicionais
+    variations = expand_query(question, game_title)
+    all_ranked_lists = [original_results]
+    for variation in variations:
+        variation_results = search_chunks(variation, game_title, db)
+        if variation_results:
+            all_ranked_lists.append(variation_results)
 
-    if not cleaned_results:
-        return "Não encontrei trechos relevantes após limpeza.", []
+    # 3. Funde com RRF e pega os top-6
+    fused_results = rrf_fusion(all_ranked_lists)[:6]
 
-    # 2. REORDENA POR PÁGINA — preserva a ordem pedagógica do manual
-    cleaned_results.sort(key=lambda x: x[0])
+    if not fused_results:
+        return "Não encontrei trechos relevantes após fusão.", []
 
-    # 3. Fontes para o frontend (texto limpo, sem \n)
+    # 4. Reordena por página — preserva ordem pedagógica do manual
+    fused_results.sort(key=lambda x: x[0])
+
+    # 5. Fontes para o frontend
     sources = [
         f"[Pág. {page}]: {texto[:150].strip()}..."
-        for page, texto in cleaned_results
+        for page, texto in fused_results
     ]
 
-    # 4. Contexto para o LLM na ordem correta do manual
+    # 6. Contexto para o LLM
     context = "\n\n".join(
         f"[Página {page}]: {texto}"
-        for page, texto in cleaned_results
+        for page, texto in fused_results
     )
 
-    # 5. Prompt com estrutura pedagógica explícita
+    # 7. Prompt pedagógico estruturado
     system_prompt = (
         "Você é um monitor experiente do jogo de tabuleiro {game_title}, "
         "com habilidade de explicar regras de forma clara e progressiva para novos jogadores. "
@@ -70,8 +136,7 @@ def get_answer(question: str, game_title: str, db: Session):
         "ESTRUTURA OBRIGATÓRIA DA RESPOSTA:\n"
         "1. REGRA GERAL: Explique o conceito principal de forma direta.\n"
         "2. COMO FUNCIONA: Detalhe o funcionamento passo a passo, se aplicável.\n"
-        "3. EXCEÇÕES: Mencione exceções ou casos especiais apenas se existirem nos trechos.\n"
-        "4. FONTE: Indique a(s) página(s) usada(s), ex: (Pág. 6).\n\n"
+        "3. EXCEÇÕES: Mencione exceções ou casos especiais apenas se existirem nos trechos.\n\n"
         "REGRAS:\n"
         "- Siga sempre a ordem acima. Nunca misture exceções com a regra geral.\n"
         "- Se uma seção não se aplicar à pergunta, omita-a silenciosamente.\n"
@@ -93,4 +158,12 @@ def get_answer(question: str, game_title: str, db: Session):
         "game_title": game_title
     })
 
-    return response.content, sources
+    # 8. Adiciona fontes ao final da resposta
+    paginas = []
+    for page, _ in fused_results:
+        if page not in paginas:
+            paginas.append(page)
+    paginas_str = ", ".join(f"Página {p}" for p in paginas)
+    resposta_final = f"{response.content}\n\nFONTES: {paginas_str}"
+
+    return resposta_final, sources
