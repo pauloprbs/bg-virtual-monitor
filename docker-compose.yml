@@ -5,6 +5,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     ports:
       - 8000:8000
     env_file:
@@ -20,6 +22,8 @@ services:
     command: ["streamlit", "run", "app/frontend.py", "--server.port=8501", "--server.address=0.0.0.0"]
     environment:
       - BACKEND_URL=http://app:8000
+    env_file:
+      - .env
     depends_on:
       - app
 
@@ -40,7 +44,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-  
+
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
@@ -50,7 +54,18 @@ services:
       - ollama_storage:/root/.ollama
     restart: always
     entrypoint: /bin/sh
-    command: -c "/bin/ollama serve & sleep 10 && ollama pull bge-m3 && tail -f /dev/null"
+    command: >
+      -c "/bin/ollama serve &
+          sleep 10 &&
+          ollama pull bge-m3 &&
+          ollama pull qwen2.5:3b &&
+          tail -f /dev/null"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list | grep -q qwen2.5"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
 
 volumes:
   bg_virtual_monitor_app:

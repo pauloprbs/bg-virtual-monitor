@@ -2,51 +2,69 @@ import os
 import json
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from langchain_ollama import OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.utils.text_processor import super_clean
 
+# ── Embeddings ────────────────────────────────────────────────────────────────
 embeddings = OllamaEmbeddings(model="bge-m3", base_url="http://ollama:11434")
 
-llm = ChatGroq(
-    temperature=0,
-    model_name="llama-3.1-8b-instant",
-    groq_api_key=os.getenv("GROQ_API_KEY")
-)
+# ── Seleção de LLM via variável de ambiente ───────────────────────────────────
+# Para usar o Groq:  LLM_PROVIDER=groq  (padrão)
+# Para usar local:   LLM_PROVIDER=ollama  e  LLM_MODEL=qwen2.5:3b
+#
+# No .env ou docker-compose:
+#   LLM_PROVIDER=groq
+#   LLM_MODEL=llama-3.1-8b-instant   (ignorado quando provider=ollama usa LLM_MODEL)
+#   LLM_PROVIDER=ollama
+#   LLM_MODEL=qwen2.5:3b
 
-# Constante do RRF — valor padrão da literatura é 60
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
+LLM_MODEL    = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
+OLLAMA_URL   = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+
+if LLM_PROVIDER == "ollama":
+    llm = ChatOllama(
+        model=LLM_MODEL,
+        base_url=OLLAMA_URL,
+        temperature=0,
+    )
+else:
+    llm = ChatGroq(
+        temperature=0,
+        model_name=LLM_MODEL,
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+    )
+
+# ── Constante do RRF ──────────────────────────────────────────────────────────
 RRF_K = 60
 
 
 def expand_query(question: str, game_title: str) -> list[str]:
-    """Usa o LLM para gerar 3 variações da pergunta original."""
+    """Gera 1 variação da pergunta para ampliar o recall do retriever."""
     prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "Você é um assistente que ajuda a melhorar buscas em manuais do jogo de tabuleiro {game_title}. "
-         "Dado uma pergunta de um jogador, gere exatamente 3 variações diferentes dela, "
-         "usando vocabulário alternativo que possa aparecer no manual. "
-         "Responda APENAS com um JSON array de strings, sem explicações. "
-         'Exemplo: ["variação 1", "variação 2", "variação 3"]'),
+         "Você é um assistente que ajuda a melhorar buscas em manuais do jogo {game_title}. "
+         "Dado uma pergunta, gere exatamente 1 variação usando vocabulário alternativo "
+         "que possa aparecer no manual. "
+         "Responda APENAS com um JSON array de string. Exemplo: [\"variacao 1\"]"),
         ("human", "{question}")
     ])
     chain = prompt | llm
     response = chain.invoke({"question": question, "game_title": game_title})
-
     try:
         variations = json.loads(response.content)
         if isinstance(variations, list):
-            return [str(v) for v in variations[:3]]
+            return [str(v) for v in variations[:1]]
     except (json.JSONDecodeError, ValueError):
         pass
-
-    # Fallback: retorna lista vazia, a busca original ainda será usada
     return []
 
 
 def search_chunks(query: str, game_title: str, db: Session, limit: int = 6) -> list[tuple]:
-    """Faz uma busca vetorial e retorna lista de (content, page_number)."""
+    """Busca vetorial — retorna lista de (content, page_number)."""
     query_vector = embeddings.embed_query(query)
     sql = text("""
         SELECT c.content, c.page_number
@@ -66,30 +84,22 @@ def search_chunks(query: str, game_title: str, db: Session, limit: int = 6) -> l
 
 def rrf_fusion(ranked_lists: list[list[tuple]], k: int = RRF_K) -> list[tuple]:
     """
-    Reciprocal Rank Fusion.
-    Cada lista é uma sequência ordenada de (content, page_number).
-    Retorna lista fundida e reordenada por score RRF decrescente.
+    Reciprocal Rank Fusion (Cormack et al., 2009).
+    Pontua cada chunk pela posição em cada lista e funde por score acumulado.
     """
     scores: dict[str, float] = {}
-    # Guarda o conteúdo original para recuperar depois
     chunk_data: dict[str, tuple] = {}
 
     for ranked_list in ranked_lists:
         for position, (content, page_number) in enumerate(ranked_list):
-            # Fingerprint pelo conteúdo limpo para deduplicar entre listas
             texto_limpo = super_clean(content)
             fingerprint = " ".join(texto_limpo.split()[:20])
-
-            # Acumula score RRF
             scores[fingerprint] = scores.get(fingerprint, 0.0) + 1.0 / (k + position + 1)
-
-            # Registra dados do chunk (primeira ocorrência ganha)
             if fingerprint not in chunk_data:
                 chunk_data[fingerprint] = (page_number, texto_limpo)
 
-    # Ordena por score RRF decrescente
-    sorted_fingerprints = sorted(scores, key=lambda fp: scores[fp], reverse=True)
-    return [chunk_data[fp] for fp in sorted_fingerprints]
+    sorted_fps = sorted(scores, key=lambda fp: scores[fp], reverse=True)
+    return [chunk_data[fp] for fp in sorted_fps]
 
 
 def get_answer(question: str, game_title: str, db: Session):
@@ -99,7 +109,7 @@ def get_answer(question: str, game_title: str, db: Session):
     if not original_results:
         return "Lamentavelmente, não encontrei informações sobre este jogo no manual.", []
 
-    # 2. Gera variações e faz buscas adicionais
+    # 2. Query expansion (1 variação) + busca adicional
     variations = expand_query(question, game_title)
     all_ranked_lists = [original_results]
     for variation in variations:
@@ -107,7 +117,7 @@ def get_answer(question: str, game_title: str, db: Session):
         if variation_results:
             all_ranked_lists.append(variation_results)
 
-    # 3. Funde com RRF e pega os top-6
+    # 3. RRF — funde e pega top-6
     fused_results = rrf_fusion(all_ranked_lists)[:6]
 
     if not fused_results:
@@ -128,13 +138,15 @@ def get_answer(question: str, game_title: str, db: Session):
         for page, texto in fused_results
     )
 
-    # 7. Prompt pedagógico estruturado
+    # 7. Prompt pedagógico — corrigido para não inverter permissões (fix Q19)
     system_prompt = (
         "Você é um monitor experiente do jogo de tabuleiro {game_title}, "
         "com habilidade de explicar regras de forma clara e progressiva para novos jogadores. "
         "Responda usando EXCLUSIVAMENTE os trechos do manual fornecidos abaixo.\n\n"
         "ESTRUTURA OBRIGATÓRIA DA RESPOSTA:\n"
-        "1. REGRA GERAL: Explique o conceito principal de forma direta.\n"
+        "1. REGRA GERAL: Explique o conceito principal exatamente como está nos trechos. "
+        "Se a regra é uma permissão, enuncie como permissão. "
+        "Se é uma proibição, enuncie como proibição. Nunca inverta o sentido.\n"
         "2. COMO FUNCIONA: Detalhe o funcionamento passo a passo, se aplicável.\n"
         "3. EXCEÇÕES: Mencione exceções ou casos especiais apenas se existirem nos trechos.\n\n"
         "REGRAS:\n"
