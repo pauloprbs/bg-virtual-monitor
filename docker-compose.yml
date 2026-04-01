@@ -1,32 +1,5 @@
 services:
-  app:
-    build: .
-    container_name: bg_virtual_monitor_app
-    depends_on:
-      db:
-        condition: service_healthy
-      ollama:
-        condition: service_healthy
-    ports:
-      - 8000:8000
-    env_file:
-      - .env
-    volumes:
-      - .:/app
-
-  frontend:
-    build: .
-    container_name: bg_virtual_monitor_frontend
-    ports:
-      - "8501:8501"
-    command: ["streamlit", "run", "app/frontend.py", "--server.port=8501", "--server.address=0.0.0.0"]
-    environment:
-      - BACKEND_URL=http://app:8000
-    env_file:
-      - .env
-    depends_on:
-      - app
-
+  # ── Banco de Dados com Vetores ──────────────────────────────────────────────
   db:
     image: pgvector/pgvector:pg16
     container_name: postgres
@@ -40,11 +13,12 @@ services:
       - POSTGRES_DB=${POSTGRES_DB}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
 
+  # ── Ollama com Auto-Download de Modelos ─────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
@@ -53,21 +27,70 @@ services:
     volumes:
       - ollama_storage:/root/.ollama
     restart: always
+    # O entrypoint garante que os modelos bge-m3 e qwen2.5 existam localmente
     entrypoint: /bin/sh
     command: >
-      -c "/bin/ollama serve &
-          sleep 10 &&
-          ollama pull bge-m3 &&
-          ollama pull qwen2.5:3b &&
-          tail -f /dev/null"
+      -c "ollama serve & 
+          sleep 10 && 
+          ollama pull bge-m3 && 
+          ollama pull qwen2.5:3b && 
+          wait"
     healthcheck:
-      test: ["CMD-SHELL", "ollama list | grep -q qwen2.5"]
-      interval: 30s
+      # Só fica 'healthy' quando o modelo de chat (mais pesado) termina o download
+      test: ["CMD-SHELL", "ollama list | grep -q 'qwen2.5'"]
+      interval: 20s
       timeout: 10s
-      retries: 10
-      start_period: 120s
+      retries: 50 # Aumentado para ~15 min (tempo de download em conexões lentas)
+      start_period: 30s
+
+  # ── Ingestão Automática (Executa uma vez) ───────────────────────────────────
+  ingest:
+    build: .
+    container_name: bg_virtual_monitor_ingest
+    command: ["python", "scripts/ingest.py"] # Ajuste o path se necessário
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    restart: "no" # Garante que não entre em loop após concluir a ingestão
+
+  # ── Backend API ─────────────────────────────────────────────────────────────
+  app:
+    build: .
+    container_name: bg_virtual_monitor_app
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ingest:
+        condition: service_completed_successfully # Só sobe após o banco ser populado
+    ports:
+      - 8000:8000
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+
+  # ── Interface Streamlit ─────────────────────────────────────────────────────
+  frontend:
+    build: .
+    container_name: bg_virtual_monitor_frontend
+    ports:
+      - "8501:8501"
+    command: ["streamlit", "run", "app/frontend.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    environment:
+      - BACKEND_URL=http://app:8000
+    env_file:
+      - .env
+    depends_on:
+      - app
 
 volumes:
-  bg_virtual_monitor_app:
   postgres_data:
   ollama_storage:

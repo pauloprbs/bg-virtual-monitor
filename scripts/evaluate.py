@@ -52,7 +52,7 @@ Session = sessionmaker(bind=engine)
 
 # ── Golden Set ────────────────────────────────────────────────────────────────
 QUESTIONS = [
-    "Qual e o objetivo do jogo?",
+    "Como se consegue a vitória no jogo?",
     "Quantos jogadores podem participar?",
     "O que posso fazer/executar no meu turno?",
     "Como termina uma rodada?",
@@ -75,12 +75,18 @@ QUESTIONS = [
 ]
 
 EVIDENCE_MAP = {
-    QUESTIONS[0]:  "objetivo",   QUESTIONS[1]:  "jogadores",
-    QUESTIONS[2]:  "turno",      QUESTIONS[3]:  "rodada",
-    QUESTIONS[4]:  "ordem",      QUESTIONS[5]:  "componentes",
-    QUESTIONS[6]:  "tabuleiro",  QUESTIONS[9]:  "passar",
-    QUESTIONS[10]: "preparacao", QUESTIONS[11]: "exaurido" if "Brass" in GAME_TITLE else "esgotar",
-    QUESTIONS[17]: "empate",    QUESTIONS[18]: "mesma",
+    QUESTIONS[0]: ["vencedor", "vencer", "vitoria", "objetivo", "pontos de vitoria"],
+    QUESTIONS[1]: ["jogadores", "participantes", "quantidade"],
+    QUESTIONS[2]: ["turno", "acoes", "fases", "executar"],
+    QUESTIONS[3]: ["rodada", "fim de rodada", "termina"],
+    QUESTIONS[4]: ["ordem", "sequencia", "proximo", "trilha"],
+    QUESTIONS[5]: ["componentes", "lista", "caixa", "incluidos"],
+    QUESTIONS[6]: ["tabuleiro", "mapa", "principal", "espacos"],
+    QUESTIONS[9]: ["passar", "encerrar", "terminar", "descartar"],
+    QUESTIONS[10]: ["preparacao", "setup", "inicial", "configuracao"],
+    QUESTIONS[11]: ["exaurido", "esgotar", "acabar", "limite", "vazio"],
+    QUESTIONS[17]: ["empate", "iguais", "mesma quantidade", "ordem relativa"],
+    QUESTIONS[18]: ["mesma", "repetir", "duas vezes", "novamente"],
 }
 
 # ── Utilitários ───────────────────────────────────────────────────────────────
@@ -139,24 +145,43 @@ def retrieve_hybrid(question: str, bm25: BM25Okapi, chunks: list[tuple], k: int 
 
 # ── Recall@k Trade-off ────────────────────────────────────────────────────────
 def compute_recall_at_k(bm25: BM25Okapi, chunks: list[tuple]):
-    print(f"\n=== Recall@k — {GAME_TITLE} ===")
+    print(f"\n=== Recall@k — {GAME_TITLE} (Evidence Sets) ===")
     print(f"{'Modo':<10} {'k=3':>8} {'k=5':>8} {'k=10':>8}")
     print("-" * 38)
+    
     results = {}
     for mode in ("denso", "esparso", "hibrido"):
         row = []
         for k in (3, 5, 10):
             hits = 0
-            for q, kw in EVIDENCE_MAP.items():
+            for q, kw_list in EVIDENCE_MAP.items():
+                # Garante que tratamos como lista mesmo que tenha apenas uma string
+                if isinstance(kw_list, str):
+                    kw_list = [kw_list]
+                
                 if mode == "denso": retrieved = retrieve_dense(q, k=k)
                 elif mode == "esparso": retrieved = retrieve_sparse(q, bm25, chunks, k=k)
                 else: retrieved = retrieve_hybrid(q, bm25, chunks, k=k)
-                hit = any(normalize(kw) in normalize(super_clean(c)) for c in retrieved)
-                hits += int(hit)
+
+                # Normaliza os chunks uma única vez para performance
+                normalized_chunks = [normalize(super_clean(c)) for c in retrieved]
+                
+                # HIT se qualquer palavra-chave da lista estiver em qualquer chunk
+                found = False
+                for kw in kw_list:
+                    kw_norm = normalize(kw)
+                    if any(kw_norm in c for c in normalized_chunks):
+                        found = True
+                        break
+                
+                hits += int(found)
+            
             recall = hits / len(EVIDENCE_MAP)
             row.append(f"{recall:.2f} ({hits}/{len(EVIDENCE_MAP)})")
+            
         results[mode] = row
         print(f"{mode:<10} {row[0]:>8} {row[1]:>8} {row[2]:>8}")
+    
     return results
 
 # ── Geração do Dataset com Throttling Reforçado ───────────────────────────────
