@@ -24,7 +24,7 @@ from app.services.chat_service import get_answer
 from app.utils.text_processor import super_clean
 
 # ── Configurações ─────────────────────────────────────────────────────────────
-GAME_TITLE   = "Catan"
+GAME_TITLE   = "Brass Birmingham"
 OLLAMA_URL   = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 DATABASE_URL = (
     f"postgresql+psycopg2://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
