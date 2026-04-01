@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import unicodedata
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -13,16 +14,17 @@ from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas.run_config import RunConfig
 from datasets import Dataset
+from rank_bm25 import BM25Okapi
 
-# ── Path ──────────────────────────────────────────────────────────────────────
+# ── Path e Imports do App ─────────────────────────────────────────────────────
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 from app.services.chat_service import get_answer
 from app.utils.text_processor import super_clean
 
-# ── Configuracoes ─────────────────────────────────────────────────────────────
-GAME_TITLE   = "Brass Birmingham"
+# ── Configurações ─────────────────────────────────────────────────────────────
+GAME_TITLE   = "Catan"
 OLLAMA_URL   = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 DATABASE_URL = (
     f"postgresql+psycopg2://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
@@ -30,40 +32,29 @@ DATABASE_URL = (
     f"/{os.getenv('POSTGRES_DB')}"
 )
 
-# ── Selecao de LLM (mesma logica do chat_service) ─────────────────────────────
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
 LLM_MODEL    = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
 
 if LLM_PROVIDER == "ollama":
-    print(f"LLM: Ollama ({LLM_MODEL})")
-    llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_URL, temperature=0)
+    print(f"🤖 Avaliador Local: Ollama ({LLM_MODEL})")
+    llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_URL, temperature=0, num_ctx=8192)
 else:
-    print(f"LLM: Groq ({LLM_MODEL})")
-    llm = ChatGroq(
-        model_name=LLM_MODEL,
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0,
-        max_tokens=4096,
-    )
+    print(f"☁️ Avaliador Nuvem: Groq ({LLM_MODEL})")
+    llm = ChatGroq(model_name=LLM_MODEL, groq_api_key=os.getenv("GROQ_API_KEY"),
+                   temperature=0, max_tokens=4096)
 
-# ── Banco e Embeddings ────────────────────────────────────────────────────────
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-try:
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    print("Conexao com o banco estabelecida!")
-except Exception as e:
-    print(f"ERRO DE CONEXAO: {e}")
-    sys.exit(1)
+llm_wrapper      = LangchainLLMWrapper(llm)
+embeddings_model = OllamaEmbeddings(model="bge-m3", base_url=OLLAMA_URL)
+emb_wrapper      = LangchainEmbeddingsWrapper(embeddings_model)
 
-Session    = sessionmaker(bind=engine)
-embeddings = OllamaEmbeddings(model="bge-m3", base_url=OLLAMA_URL)
+engine  = create_engine(DATABASE_URL, pool_pre_ping=True)
+Session = sessionmaker(bind=engine)
 
 # ── Golden Set ────────────────────────────────────────────────────────────────
 QUESTIONS = [
     "Qual e o objetivo do jogo?",
     "Quantos jogadores podem participar?",
-    "Quais acoes posso executar no meu turno?",
+    "O que posso fazer/executar no meu turno?",
     "Como termina uma rodada?",
     "Como e determinada a ordem dos turnos?",
     "Quais sao os componentes incluidos na caixa do jogo?",
@@ -71,8 +62,8 @@ QUESTIONS = [
     "O que acontece quando um jogador nao pode executar uma acao por falta de recursos?",
     "Como a pontuacao final e calculada e quais elementos contribuem para ela?",
     "Quando posso passar meu turno e o que isso implica?",
-    "Existe alguma regra especial que se aplica apenas em um momento especifico do jogo?",
-    "O que acontece quando algum componente limitado do jogo se esgota?",
+    "Como deve ser feita a preparacao (setup) inicial dos componentes no tabuleiro?",
+    "O que acontece quando algum componente limitado do jogo e exaurido?",
     "Existe alguma condicao que encerra o jogo antes do fim previsto?",
     "O manual oferece alguma dica ou orientacao estrategica para os jogadores?",
     "Existe alguma expansao oficial para este jogo?",
@@ -83,24 +74,38 @@ QUESTIONS = [
     "Quem e declarado vencedor em caso de empate na pontuacao final?",
 ]
 
-QUESTIONS_WITH_EVIDENCE = [
-    (QUESTIONS[0],  "objetivo"),
-    (QUESTIONS[1],  "jogadores"),
-    (QUESTIONS[2],  "acoes"),
-    (QUESTIONS[3],  "rodada"),
-    (QUESTIONS[4],  "ordem"),
-    (QUESTIONS[5],  "componentes"),
-    (QUESTIONS[6],  "tabuleiro"),
-    (QUESTIONS[9],  "passar"),
-    (QUESTIONS[10], "especial"),
-    (QUESTIONS[11], "esgota"),
-    (QUESTIONS[17], "empate"),
-    (QUESTIONS[18], "mesma"),
-]
+EVIDENCE_MAP = {
+    QUESTIONS[0]:  "objetivo",   QUESTIONS[1]:  "jogadores",
+    QUESTIONS[2]:  "turno",      QUESTIONS[3]:  "rodada",
+    QUESTIONS[4]:  "ordem",      QUESTIONS[5]:  "componentes",
+    QUESTIONS[6]:  "tabuleiro",  QUESTIONS[9]:  "passar",
+    QUESTIONS[10]: "preparacao", QUESTIONS[11]: "exaurido" if "Brass" in GAME_TITLE else "esgotar",
+    QUESTIONS[17]: "empate",    QUESTIONS[18]: "mesma",
+}
 
-# ── Funcoes ───────────────────────────────────────────────────────────────────
-def retrieve_chunks(question, k=6):
-    vector = embeddings.embed_query(question)
+# ── Utilitários ───────────────────────────────────────────────────────────────
+def normalize(text: str) -> str:
+    if not text: return ""
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+def tokenize(text: str) -> list[str]:
+    return normalize(text).split()
+
+def load_all_chunks() -> list[tuple]:
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT c.content, c.page_number
+            FROM game_chunks c
+            JOIN games g ON c.game_id = g.id
+            WHERE g.title ILIKE :title
+            ORDER BY c.page_number
+        """), {"title": f"%{GAME_TITLE}%"}).fetchall()
+    return [(r.content, r.page_number) for r in rows]
+
+# ── Retrievers ────────────────────────────────────────────────────────────────
+def retrieve_dense(question: str, k: int = 10) -> list[str]:
+    vector = embeddings_model.embed_query(question)
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT c.content FROM game_chunks c
@@ -108,84 +113,137 @@ def retrieve_chunks(question, k=6):
             WHERE g.title ILIKE :title
             ORDER BY c.embedding <=> :vector LIMIT :k
         """), {"vector": str(vector), "title": f"%{GAME_TITLE}%", "k": k}).fetchall()
-    return [super_clean(r.content) for r in rows]
+    return [r.content for r in rows]
 
+def retrieve_sparse(question: str, bm25: BM25Okapi, chunks: list[tuple], k: int = 10) -> list[str]:
+    scores  = bm25.get_scores(tokenize(question))
+    indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+    return [chunks[i][0] for i in indices]
 
-def generate_ground_truth(question, chunks):
-    context = "\n\n".join(chunks)
-    prompt = (
-        f"Com base nos trechos abaixo do manual, escreva a melhor resposta possivel "
-        f"para: '{question}'\n"
-        f"IMPORTANTE: Extraia qualquer informacao relevante dos trechos, mesmo que incompleta. "
-        f"Somente responda 'Nao encontrei essa informacao no manual' se os trechos forem "
-        f"completamente irrelevantes para a pergunta.\n\nTRECHOS:\n{context}"
-    )
-    return llm.invoke(prompt).content
+def retrieve_hybrid(question: str, bm25: BM25Okapi, chunks: list[tuple], k: int = 10) -> list[str]:
+    dense_results  = [(c, 0) for c in retrieve_dense(question, k=k)]
+    sparse_scores  = bm25.get_scores(tokenize(question))
+    sparse_indices = sorted(range(len(sparse_scores)), key=lambda i: sparse_scores[i], reverse=True)[:k]
+    sparse_results = [(chunks[i][0], chunks[i][1]) for i in sparse_indices]
 
+    RRF_K = 60
+    scores_rrf: dict[str, float] = {}
+    texts: dict[str, str] = {}
+    for ranked_list in [dense_results, sparse_results]:
+        for pos, (content, _) in enumerate(ranked_list):
+            fp = " ".join(normalize(super_clean(content)).split()[:20])
+            scores_rrf[fp] = scores_rrf.get(fp, 0.0) + 1.0 / (RRF_K + pos + 1)
+            if fp not in texts: texts[fp] = content
+    sorted_fps = sorted(scores_rrf, key=lambda fp: scores_rrf[fp], reverse=True)[:k]
+    return [texts[fp] for fp in sorted_fps]
 
-def compute_recall_at_k():
-    print("\n=== Recall@k ===")
-    for k in (3, 5, 10):
-        hits = 0
-        for q, kw in QUESTIONS_WITH_EVIDENCE:
-            chunks = retrieve_chunks(q, k=k)
-            hit = any(kw.lower() in c.lower() for c in chunks)
-            if not hit:
-                print(f"  MISS (k={k}): '{kw}' nao encontrado para: {q[:50]}")
-            hits += int(hit)
-        print(f"Recall@{k}: {hits/len(QUESTIONS_WITH_EVIDENCE):.2f} ({hits}/{len(QUESTIONS_WITH_EVIDENCE)})")
+# ── Recall@k Trade-off ────────────────────────────────────────────────────────
+def compute_recall_at_k(bm25: BM25Okapi, chunks: list[tuple]):
+    print(f"\n=== Recall@k — {GAME_TITLE} ===")
+    print(f"{'Modo':<10} {'k=3':>8} {'k=5':>8} {'k=10':>8}")
+    print("-" * 38)
+    results = {}
+    for mode in ("denso", "esparso", "hibrido"):
+        row = []
+        for k in (3, 5, 10):
+            hits = 0
+            for q, kw in EVIDENCE_MAP.items():
+                if mode == "denso": retrieved = retrieve_dense(q, k=k)
+                elif mode == "esparso": retrieved = retrieve_sparse(q, bm25, chunks, k=k)
+                else: retrieved = retrieve_hybrid(q, bm25, chunks, k=k)
+                hit = any(normalize(kw) in normalize(super_clean(c)) for c in retrieved)
+                hits += int(hit)
+            recall = hits / len(EVIDENCE_MAP)
+            row.append(f"{recall:.2f} ({hits}/{len(EVIDENCE_MAP)})")
+        results[mode] = row
+        print(f"{mode:<10} {row[0]:>8} {row[1]:>8} {row[2]:>8}")
+    return results
 
-
-def build_ragas_dataset():
+# ── Geração do Dataset com Throttling Reforçado ───────────────────────────────
+def build_ragas_dataset(bm25: BM25Okapi, chunks: list[tuple]) -> Dataset:
     db, records = Session(), []
-    print("\n--- Gerando Corpus (20 Perguntas) ---")
+    print(f"\n--- Gerando Corpus (20 Perguntas) ---")
+
     for i, q in enumerate(QUESTIONS):
         print(f"  [{i+1:02d}/20] {q[:50]}...")
-        answer, _ = get_answer(q, GAME_TITLE, db)
-        ctxs      = retrieve_chunks(q, k=6)
-        gt        = generate_ground_truth(q, ctxs)
-        records.append({"question": q, "answer": answer, "contexts": ctxs, "ground_truth": gt})
-        if LLM_PROVIDER != "ollama":
-            time.sleep(0.5)  # rate limit so necessario no Groq
+        success = False
+        retry_wait = 60 # Tempo inicial de espera caso dê erro 429
+
+        while not success:
+            try:
+                # 1. Gera resposta (Pode bater no limite se o contexto for grande)
+                answer, _ = get_answer(q, GAME_TITLE, db)
+                
+                # 2. Busca contextos híbridos
+                ctxs = retrieve_hybrid(q, bm25, chunks, k=10)
+                
+                # 3. Gera Ground Truth
+                gt_prompt = (
+                    f"Responda concisamente usando apenas estes trechos do manual: '{q}'\n\n"
+                    "TRECHOS:\n" + "\n\n".join(ctxs[:4])
+                )
+                ground_truth = llm.invoke(gt_prompt).content
+                
+                records.append({"question": q, "answer": answer, "contexts": ctxs, "ground_truth": ground_truth})
+                
+                # Pausa preventiva obrigatória para o Groq
+                if LLM_PROVIDER == "groq":
+                    time.sleep(45) 
+                
+                success = True
+            except Exception as e:
+                if "429" in str(e):
+                    print(f"  ⏳ Rate limit atingido. Aguardando {retry_wait}s...")
+                    time.sleep(retry_wait)
+                    retry_wait *= 1.5 # Backoff exponencial se persistir
+                else:
+                    print(f"  ❌ Erro fatal na questão {i+1}: {e}")
+                    success = True # Sai do loop para não travar o script
+
     db.close()
     return Dataset.from_list(records)
 
-
-def run_ragas_in_batches(dataset, batch_size=5):
-    print(f"\n--- Iniciando Avaliacao RAGAS (Lotes de {batch_size}) ---")
-    llm_wrapper = LangchainLLMWrapper(llm)
-    emb_wrapper = LangchainEmbeddingsWrapper(embeddings)
-    config      = RunConfig(max_workers=1, timeout=240, max_retries=5)
-
+# ── Execução RAGAS com Throttling ─────────────────────────────────────────────
+def run_ragas_in_batches(dataset: Dataset, batch_size: int = 5):
+    print(f"\n--- Avaliação RAGAS (Lotes de {batch_size}) ---")
+    # Configuração de workers=1 é CRÍTICA para evitar 429 simultâneos
+    config = RunConfig(max_workers=1, timeout=900, max_retries=10)
     all_dfs = []
+    
     for i in range(0, len(dataset), batch_size):
-        end   = min(i + batch_size, len(dataset))
-        print(f"  Avaliando perguntas {i+1} a {end}...")
+        end = min(i + batch_size, len(dataset))
+        print(f"  Processando {i+1} a {end}...")
         batch = dataset.select(range(i, end))
-        try:
-            res = evaluate(
-                batch,
-                metrics=[faithfulness],
-                llm=llm_wrapper,
-                embeddings=emb_wrapper,
-                run_config=config,
-            )
-            all_dfs.append(res.to_pandas())
-        except Exception as e:
-            print(f"  Erro no lote: {e}")
+        
+        success = False
+        while not success:
+            try:
+                res = evaluate(batch, metrics=[faithfulness], llm=llm_wrapper, embeddings=emb_wrapper, run_config=config)
+                all_dfs.append(res.to_pandas())
+                
+                if LLM_PROVIDER == "groq":
+                    time.sleep(40) # Descanso entre lotes
+                success = True
+            except Exception as e:
+                if "429" in str(e):
+                    print("  ⏳ Rate limit no RAGAS. Pausando 60s...")
+                    time.sleep(60)
+                else:
+                    print(f"  ⚠️ Erro no processamento: {e}")
+                    success = True
 
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
-        output   = f"ragas_results_{LLM_PROVIDER}.json"
+        output = f"ragas_{GAME_TITLE.lower().replace(' ','_')}_{LLM_PROVIDER}.json"
         final_df.to_json(output, orient="records", indent=2, force_ascii=False)
-        print(f"\nAvaliacao concluida! Media de Faithfulness: {final_df['faithfulness'].mean():.4f}")
-        print(f"Resultados salvos em {output}")
+        print(f"\n✅ Faithfulness Média: {final_df['faithfulness'].mean():.4f}")
         return final_df
     return None
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    compute_recall_at_k()
-    ds = build_ragas_dataset()
-    run_ragas_in_batches(ds)
+    all_chunks = load_all_chunks()
+    bm25_index = BM25Okapi([tokenize(super_clean(c)) for c, _ in all_chunks])
+    
+    compute_recall_at_k(bm25_index, all_chunks)
+    ds = build_ragas_dataset(bm25_index, all_chunks)
+    if ds: run_ragas_in_batches(ds)

@@ -1,10 +1,12 @@
 import os
 import json
+import unicodedata
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
+from rank_bm25 import BM25Okapi
 
 from app.utils.text_processor import super_clean
 
@@ -12,25 +14,12 @@ from app.utils.text_processor import super_clean
 embeddings = OllamaEmbeddings(model="bge-m3", base_url="http://ollama:11434")
 
 # ── Seleção de LLM via variável de ambiente ───────────────────────────────────
-# Para usar o Groq:  LLM_PROVIDER=groq  (padrão)
-# Para usar local:   LLM_PROVIDER=ollama  e  LLM_MODEL=qwen2.5:3b
-#
-# No .env ou docker-compose:
-#   LLM_PROVIDER=groq
-#   LLM_MODEL=llama-3.1-8b-instant   (ignorado quando provider=ollama usa LLM_MODEL)
-#   LLM_PROVIDER=ollama
-#   LLM_MODEL=qwen2.5:3b
-
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
 LLM_MODEL    = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
 OLLAMA_URL   = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 
 if LLM_PROVIDER == "ollama":
-    llm = ChatOllama(
-        model=LLM_MODEL,
-        base_url=OLLAMA_URL,
-        temperature=0,
-    )
+    llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_URL, temperature=0)
 else:
     llm = ChatGroq(
         temperature=0,
@@ -42,29 +31,60 @@ else:
 RRF_K = 60
 
 
-def expand_query(question: str, game_title: str) -> list[str]:
-    """Gera 1 variação da pergunta para ampliar o recall do retriever."""
-    prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "Você é um assistente que ajuda a melhorar buscas em manuais do jogo {game_title}. "
-         "Dado uma pergunta, gere exatamente 1 variação usando vocabulário alternativo "
-         "que possa aparecer no manual. "
-         "Responda APENAS com um JSON array de string. Exemplo: [\"variacao 1\"]"),
-        ("human", "{question}")
-    ])
-    chain = prompt | llm
-    response = chain.invoke({"question": question, "game_title": game_title})
-    try:
-        variations = json.loads(response.content)
-        if isinstance(variations, list):
-            return [str(v) for v in variations[:1]]
-    except (json.JSONDecodeError, ValueError):
-        pass
-    return []
+# ── Normalização para BM25 ────────────────────────────────────────────────────
+def _normalize(text: str) -> str:
+    """Remove acentos e lowercaseapara tokenização BM25 consistente."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return sem_acento.lower()
 
 
-def search_chunks(query: str, game_title: str, db: Session, limit: int = 6) -> list[tuple]:
-    """Busca vetorial — retorna lista de (content, page_number)."""
+def _tokenize(text: str) -> list[str]:
+    return _normalize(text).split()
+
+
+# ── Cache BM25 por jogo ───────────────────────────────────────────────────────
+# Evita reindexar a cada chamada — o índice é construído uma vez por sessão.
+_bm25_cache: dict[str, tuple] = {}  # game_title -> (BM25Okapi, [(content, page_number)])
+
+
+def _get_bm25_index(game_title: str, db: Session) -> tuple:
+    """Carrega todos os chunks do jogo e constrói (ou retorna do cache) o índice BM25."""
+    if game_title in _bm25_cache:
+        return _bm25_cache[game_title]
+
+    sql = text("""
+        SELECT c.content, c.page_number
+        FROM game_chunks c
+        JOIN games g ON c.game_id = g.id
+        WHERE g.title ILIKE :title
+        ORDER BY c.page_number
+    """)
+    rows = db.execute(sql, {"title": f"%{game_title}%"}).fetchall()
+    chunks = [(r.content, r.page_number) for r in rows]
+
+    corpus_tokens = [_tokenize(super_clean(content)) for content, _ in chunks]
+    bm25 = BM25Okapi(corpus_tokens)
+
+    _bm25_cache[game_title] = (bm25, chunks)
+    return bm25, chunks
+
+
+# ── Retriever Esparso (BM25) ──────────────────────────────────────────────────
+def search_chunks_bm25(query: str, game_title: str, db: Session, limit: int = 6) -> list[tuple]:
+    """Busca esparsa por palavra-chave — retorna lista de (content, page_number)."""
+    bm25, chunks = _get_bm25_index(game_title, db)
+    query_tokens = _tokenize(query)
+    scores = bm25.get_scores(query_tokens)
+
+    # Pega os top-limit índices ordenados por score decrescente
+    ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:limit]
+    return [chunks[i] for i in ranked_indices]
+
+
+# ── Retriever Denso (vetorial) ────────────────────────────────────────────────
+def search_chunks_dense(query: str, game_title: str, db: Session, limit: int = 6) -> list[tuple]:
+    """Busca densa via embedding — retorna lista de (content, page_number)."""
     query_vector = embeddings.embed_query(query)
     sql = text("""
         SELECT c.content, c.page_number
@@ -82,10 +102,12 @@ def search_chunks(query: str, game_title: str, db: Session, limit: int = 6) -> l
     return [(r.content, r.page_number) for r in rows]
 
 
+# ── RRF Fusion ────────────────────────────────────────────────────────────────
 def rrf_fusion(ranked_lists: list[list[tuple]], k: int = RRF_K) -> list[tuple]:
     """
     Reciprocal Rank Fusion (Cormack et al., 2009).
-    Pontua cada chunk pela posição em cada lista e funde por score acumulado.
+    Recebe N listas ordenadas de (content, page_number).
+    Retorna lista fundida por score RRF acumulado, deduplicada por fingerprint.
     """
     scores: dict[str, float] = {}
     chunk_data: dict[str, tuple] = {}
@@ -102,58 +124,83 @@ def rrf_fusion(ranked_lists: list[list[tuple]], k: int = RRF_K) -> list[tuple]:
     return [chunk_data[fp] for fp in sorted_fps]
 
 
-def get_answer(question: str, game_title: str, db: Session):
-    # 1. Busca original
-    original_results = search_chunks(question, game_title, db)
+# ── Query Expansion ───────────────────────────────────────────────────────────
+def expand_query(question: str, game_title: str) -> list[str]:
+    """Gera 2 variações da pergunta para ampliar o recall do retriever denso."""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Você é um assistente especialista em Board Games que ajuda a melhorar buscas "
+         "no manual de {game_title}. Dado uma pergunta de um jogador, gere EXATAMENTE 2 "
+         "variações usando termos técnicos e vocabulário específico que costuma aparecer "
+         "em manuais de regras (ex: setup, era, turno, acoes). "
+         "Responda APENAS com um JSON array de strings. "
+         "Exemplo: [\"variacao 1\", \"variacao 2\"]"),
+        ("human", "{question}")
+    ])
+    chain = prompt | llm
+    response = chain.invoke({"question": question, "game_title": game_title})
+    try:
+        variations = json.loads(response.content)
+        if isinstance(variations, list):
+            return [str(v) for v in variations[:2]]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return []
 
-    if not original_results:
+
+# ── Pipeline Principal ────────────────────────────────────────────────────────
+def get_answer(question: str, game_title: str, db: Session):
+    # 1. Busca densa original
+    dense_original = search_chunks_dense(question, game_title, db, limit=10)
+
+    if not dense_original:
         return "Lamentavelmente, não encontrei informações sobre este jogo no manual.", []
 
-    # 2. Query expansion (1 variação) + busca adicional
+    # 2. Query expansion — 2 variações densas adicionais
     variations = expand_query(question, game_title)
-    all_ranked_lists = [original_results]
+    all_ranked_lists = [dense_original]
     for variation in variations:
-        variation_results = search_chunks(variation, game_title, db)
+        variation_results = search_chunks_dense(variation, game_title, db, limit=10)
         if variation_results:
             all_ranked_lists.append(variation_results)
 
-    # 3. RRF — funde e pega top-6
-    fused_results = rrf_fusion(all_ranked_lists)[:6]
+    # 3. Busca esparsa BM25 — recuperação por palavra-chave exata
+    sparse_results = search_chunks_bm25(question, game_title, db, limit=10)
+    if sparse_results:
+        all_ranked_lists.append(sparse_results)
+
+    # 4. RRF híbrido — funde denso + expansão + esparso, pega top-10
+    fused_results = rrf_fusion(all_ranked_lists)[:10]
 
     if not fused_results:
         return "Não encontrei trechos relevantes após fusão.", []
 
-    # 4. Reordena por página — preserva ordem pedagógica do manual
+    # 5. Reordena por página — preserva ordem pedagógica do manual
     fused_results.sort(key=lambda x: x[0])
 
-    # 5. Fontes para o frontend
+    # 6. Fontes para o frontend
     sources = [
         f"[Pág. {page}]: {texto[:150].strip()}..."
         for page, texto in fused_results
     ]
 
-    # 6. Contexto para o LLM
+    # 7. Contexto para o LLM
     context = "\n\n".join(
         f"[Página {page}]: {texto}"
         for page, texto in fused_results
     )
 
-    # 7. Prompt pedagógico — corrigido para não inverter permissões (fix Q19)
+    # 8. Prompt pedagógico
     system_prompt = (
-        "Você é um monitor experiente do jogo de tabuleiro {game_title}, "
-        "com habilidade de explicar regras de forma clara e progressiva para novos jogadores. "
-        "Responda usando EXCLUSIVAMENTE os trechos do manual fornecidos abaixo.\n\n"
-        "ESTRUTURA OBRIGATÓRIA DA RESPOSTA:\n"
-        "1. REGRA GERAL: Explique o conceito principal exatamente como está nos trechos. "
-        "Se a regra é uma permissão, enuncie como permissão. "
-        "Se é uma proibição, enuncie como proibição. Nunca inverta o sentido.\n"
-        "2. COMO FUNCIONA: Detalhe o funcionamento passo a passo, se aplicável.\n"
-        "3. EXCEÇÕES: Mencione exceções ou casos especiais apenas se existirem nos trechos.\n\n"
-        "REGRAS:\n"
-        "- Siga sempre a ordem acima. Nunca misture exceções com a regra geral.\n"
-        "- Se uma seção não se aplicar à pergunta, omita-a silenciosamente.\n"
-        "- Não invente informações além do que está nos trechos.\n"
-        "- Se a informação for insuficiente, diga apenas o que está disponível."
+        "Você é um monitor experiente de {game_title}. Sua missão é explicar as regras "
+        "de forma didática, fluida e amigável. Use EXCLUSIVAMENTE os trechos fornecidos.\n\n"
+        "DIRETRIZES DE RESPOSTA:\n"
+        "- Responda de forma direta. Comece enunciando a regra principal com naturalidade.\n"
+        "- Se a regra envolver passos ou uma sequência, use lista numerada ou bullets.\n"
+        "- Se a regra for uma permissão, enuncie como permissão. Se for proibição, como proibição.\n"
+        "- Mencione exceções apenas se existirem nos trechos, integrando-as ao texto.\n"
+        "- Se a informação for insuficiente, informe honestamente que o manual não detalha esse ponto.\n"
+        "- NUNCA utilize conhecimento externo ou invente regras que não estejam nos trechos."
     )
 
     prompt = ChatPromptTemplate.from_messages([
@@ -170,7 +217,7 @@ def get_answer(question: str, game_title: str, db: Session):
         "game_title": game_title
     })
 
-    # 8. Adiciona fontes ao final da resposta
+    # 9. Adiciona fontes ao final da resposta
     paginas = []
     for page, _ in fused_results:
         if page not in paginas:
