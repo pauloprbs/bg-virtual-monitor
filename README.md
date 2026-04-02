@@ -85,7 +85,7 @@ bg-virtual-monitor/
 ### 1. Clone o repositório
 
 ```bash
-git clone https://github.com/seu-usuario/bg-virtual-monitor.git
+git clone git@github.com:pauloprbs/bg-virtual-monitor.git
 cd bg-virtual-monitor
 ```
 
@@ -125,8 +125,7 @@ Coloque os arquivos PDF na pasta `data/manuals/`. O nome do arquivo vira o títu
 ```
 data/manuals/
 ├── Brass_Birmingham.pdf   →  "Brass Birmingham"
-├── Catan.pdf              →  "Catan"
-└── Azul.pdf               →  "Azul"
+└── Catan.pdf              →  "Catan"
 ```
 
 ### 4. Suba o projeto
@@ -154,33 +153,64 @@ Nas execuções seguintes, os modelos e os dados já estão em cache — o siste
 
 ## 📊 Avaliação
 
-### Recall@k — Trilha A (3 modos)
-
-Execute dentro do container:
+### Como rodar
 
 ```bash
 docker exec -it bg_virtual_monitor_app python scripts/evaluate.py
 ```
 
-O script gera automaticamente:
-- Tabela de Recall@k (k=3, 5 e 10) para os modos **denso**, **esparso** e **híbrido**
-- Avaliação RAGAS (faithfulness) com o LLM configurado no `.env`
-- Arquivo `ragas_results_<provider>.json` com resultados por pergunta
+O script gera:
+- Tabela de Recall@k (k=3, 5, 10) para os três modos de recuperação
+- Avaliação RAGAS de faithfulness para cada pergunta do golden set
+- Arquivo `ragas_results_<provider>.json` com resultados detalhados
 
-### Resultados obtidos (Brass Birmingham)
+### Recall@k — Trilha A (Brass Birmingham)
 
 | Modo | Recall@3 | Recall@5 | Recall@10 |
 |---|---|---|---|
-| Denso | 1.00 | 1.00 | 1.00 |
-| Esparso (BM25) | 0.75 | 0.75 | 0.75 |
-| Híbrido (RRF) | 1.00 | 1.00 | 1.00 |
+| Denso (baseline) | 1.00 (12/12) | 1.00 (12/12) | 1.00 (12/12) |
+| Esparso — BM25 | 0.75 (9/12) | 0.75 (9/12) | 0.75 (9/12) |
+| Híbrido — RRF | 1.00 (12/12) | 1.00 (12/12) | 1.00 (12/12) |
 
-| Avaliador | Faithfulness média |
-|---|---|
-| Groq (Llama 3.1 8B) | 0.6892 |
-| Ollama (Qwen 2.5 3B) | 0.4092 |
+O modo híbrido mantém o recall máximo do denso e adiciona robustez para termos exatos via BM25. O BM25 perde em perguntas puramente semânticas, mas ganha em termos técnicos específicos como nomes de peças e ações.
 
-> O modo híbrido mantém o recall máximo do modo denso enquanto adiciona robustez para termos exatos via BM25. O modo esparso perde em perguntas semânticas mas ganha em termos técnicos específicos (ex: nomes de peças, ações). Análise completa no relatório.
+### Golden Set — Faithfulness por questão (Groq, Brass Birmingham)
+
+Avaliação RAGAS com 20 perguntas agnósticas ao jogo. Faithfulness média: **0.7466**.
+
+| ID | Pergunta | Faithfulness |
+|---|---|---|
+| Q01 | Como se consegue a vitória no jogo? | 0.91 ✅ |
+| Q02 | Quantos jogadores podem participar? | 0.75 🟡 |
+| Q03 | O que posso fazer/executar no meu turno? | 0.88 ✅ |
+| Q04 | Como termina uma rodada? | 0.90 ✅ |
+| Q05 | Como é determinada a ordem dos turnos? | 0.80 ✅ |
+| Q06 | Quais são os componentes incluídos na caixa do jogo? | 1.00 ✅ |
+| Q07 | Para que serve o tabuleiro principal? | 1.00 ✅ |
+| Q08 | O que acontece quando um jogador não pode executar uma ação por falta de recursos? | 0.33 ⚠️ |
+| Q09 | Como a pontuação final é calculada e quais elementos contribuem para ela? | 0.75 🟡 |
+| Q10 | Quando posso passar meu turno e o que isso implica? | 0.50 ⚠️ |
+| Q11 | Como deve ser feita a preparação (setup) inicial dos componentes no tabuleiro? | 0.67 🟡 |
+| Q12 | O que acontece quando algum componente limitado do jogo é exaurido? | 0.75 🟡 |
+| Q13 | Existe alguma condição que encerra o jogo antes do fim previsto? | 0.75 🟡 |
+| Q14 | O manual oferece alguma dica ou orientação estratégica para os jogadores? | 0.95 ✅ |
+| Q15 | Existe alguma expansão oficial para este jogo? | 0.00 ⚠️ |
+| Q16 | Quanto tempo dura uma partida em média? | 1.00 ✅ |
+| Q17 | O que acontece se um jogador cometer um erro em uma ação já executada? | 0.33 ⚠️ |
+| Q18 | O que acontece se dois jogadores empatarem na ordem de turno? | 1.00 ✅ |
+| Q19 | Posso executar a mesma ação mais de uma vez no mesmo turno? | 0.67 🟡 |
+| Q20 | Quem é declarado vencedor em caso de empate na pontuação final? | 1.00 ✅ |
+
+> **Nota sobre Q15 (0.00):** Esta pergunta é de recusa esperada — o manual não menciona expansões. O RAGAS penaliza a resposta porque o ground_truth gerado automaticamente divergiu da resposta de recusa do bot. Casos como Q08, Q10 e Q17 apresentam faithfulness baixo por falso negativo do avaliador: as respostas estão corretas, mas o ground_truth gerado pelo LLM puxou trechos diferentes do corpus.
+
+### Comparativo de avaliadores
+
+| Avaliador | Modelo | Faithfulness média |
+|---|---|---|
+| Groq | Llama 3.1 8B Instant | **0.7466** |
+| Ollama (local) | Qwen 2.5 3B | 0.4092 |
+
+A diferença entre avaliadores reflete a capacidade do modelo de verificar grounding — modelos menores tendem a ser mais permissivos ou inconsistentes como juízes RAGAS.
 
 ---
 
@@ -220,6 +250,7 @@ docker exec -it postgres psql -U admin -d bgvirtualmonitordb
 
 ## 👥 Equipe
 
+Alunos: Paulo Renato Baliza Silva, Carlos Augusto da Silva Cabral e Eduardo Martins de Castro Souza
 Projeto desenvolvido para a disciplina de Processamento de Linguagem Natural  
 Pós-Graduação em Inteligência Artificial Aplicada — Instituto Federal de Goiás (IFG)
 
