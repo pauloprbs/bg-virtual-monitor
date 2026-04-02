@@ -27,32 +27,22 @@ else:
         groq_api_key=os.getenv("GROQ_API_KEY"),
     )
 
-# ── Constante do RRF ──────────────────────────────────────────────────────────
 RRF_K = 60
-
 
 # ── Normalização para BM25 ────────────────────────────────────────────────────
 def _normalize(text: str) -> str:
-    """Remove acentos e lowercaseapara tokenização BM25 consistente."""
     nfkd = unicodedata.normalize("NFKD", text)
-    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
-    return sem_acento.lower()
-
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
 
 def _tokenize(text: str) -> list[str]:
     return _normalize(text).split()
 
-
 # ── Cache BM25 por jogo ───────────────────────────────────────────────────────
-# Evita reindexar a cada chamada — o índice é construído uma vez por sessão.
-_bm25_cache: dict[str, tuple] = {}  # game_title -> (BM25Okapi, [(content, page_number)])
-
+_bm25_cache: dict[str, tuple] = {}
 
 def _get_bm25_index(game_title: str, db: Session) -> tuple:
-    """Carrega todos os chunks do jogo e constrói (ou retorna do cache) o índice BM25."""
     if game_title in _bm25_cache:
         return _bm25_cache[game_title]
-
     sql = text("""
         SELECT c.content, c.page_number
         FROM game_chunks c
@@ -62,29 +52,19 @@ def _get_bm25_index(game_title: str, db: Session) -> tuple:
     """)
     rows = db.execute(sql, {"title": f"%{game_title}%"}).fetchall()
     chunks = [(r.content, r.page_number) for r in rows]
-
     corpus_tokens = [_tokenize(super_clean(content)) for content, _ in chunks]
     bm25 = BM25Okapi(corpus_tokens)
-
     _bm25_cache[game_title] = (bm25, chunks)
     return bm25, chunks
 
-
-# ── Retriever Esparso (BM25) ──────────────────────────────────────────────────
-def search_chunks_bm25(query: str, game_title: str, db: Session, limit: int = 6) -> list[tuple]:
-    """Busca esparsa por palavra-chave — retorna lista de (content, page_number)."""
+# ── Retrievers ────────────────────────────────────────────────────────────────
+def search_chunks_bm25(query: str, game_title: str, db: Session, limit: int = 10) -> list[tuple]:
     bm25, chunks = _get_bm25_index(game_title, db)
-    query_tokens = _tokenize(query)
-    scores = bm25.get_scores(query_tokens)
+    scores = bm25.get_scores(_tokenize(query))
+    ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:limit]
+    return [chunks[i] for i in ranked]
 
-    # Pega os top-limit índices ordenados por score decrescente
-    ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:limit]
-    return [chunks[i] for i in ranked_indices]
-
-
-# ── Retriever Denso (vetorial) ────────────────────────────────────────────────
-def search_chunks_dense(query: str, game_title: str, db: Session, limit: int = 6) -> list[tuple]:
-    """Busca densa via embedding — retorna lista de (content, page_number)."""
+def search_chunks_dense(query: str, game_title: str, db: Session, limit: int = 10) -> list[tuple]:
     query_vector = embeddings.embed_query(query)
     sql = text("""
         SELECT c.content, c.page_number
@@ -101,17 +81,10 @@ def search_chunks_dense(query: str, game_title: str, db: Session, limit: int = 6
     }).fetchall()
     return [(r.content, r.page_number) for r in rows]
 
-
 # ── RRF Fusion ────────────────────────────────────────────────────────────────
 def rrf_fusion(ranked_lists: list[list[tuple]], k: int = RRF_K) -> list[tuple]:
-    """
-    Reciprocal Rank Fusion (Cormack et al., 2009).
-    Recebe N listas ordenadas de (content, page_number).
-    Retorna lista fundida por score RRF acumulado, deduplicada por fingerprint.
-    """
     scores: dict[str, float] = {}
     chunk_data: dict[str, tuple] = {}
-
     for ranked_list in ranked_lists:
         for position, (content, page_number) in enumerate(ranked_list):
             texto_limpo = super_clean(content)
@@ -119,20 +92,17 @@ def rrf_fusion(ranked_lists: list[list[tuple]], k: int = RRF_K) -> list[tuple]:
             scores[fingerprint] = scores.get(fingerprint, 0.0) + 1.0 / (k + position + 1)
             if fingerprint not in chunk_data:
                 chunk_data[fingerprint] = (page_number, texto_limpo)
-
     sorted_fps = sorted(scores, key=lambda fp: scores[fp], reverse=True)
     return [chunk_data[fp] for fp in sorted_fps]
 
-
 # ── Query Expansion ───────────────────────────────────────────────────────────
 def expand_query(question: str, game_title: str) -> list[str]:
-    """Gera 2 variações da pergunta para ampliar o recall do retriever denso."""
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "Você é um assistente especialista em Board Games que ajuda a melhorar buscas "
          "no manual de {game_title}. Dado uma pergunta de um jogador, gere EXATAMENTE 2 "
          "variações usando termos técnicos e vocabulário específico que costuma aparecer "
-         "em manuais de regras (ex: setup, era, turno, acoes). "
+         "em manuais de regras. "
          "Responda APENAS com um JSON array de strings. "
          "Exemplo: [\"variacao 1\", \"variacao 2\"]"),
         ("human", "{question}")
@@ -147,50 +117,63 @@ def expand_query(question: str, game_title: str) -> list[str]:
         pass
     return []
 
-
 # ── Pipeline Principal ────────────────────────────────────────────────────────
-def get_answer(question: str, game_title: str, db: Session):
-    # 1. Busca densa original
-    dense_original = search_chunks_dense(question, game_title, db, limit=10)
+def get_answer(question: str, game_title: str, db: Session, mode: str = "hibrido"):
+    """
+    mode: "denso" | "esparso" | "hibrido"
+    - denso:   apenas busca vetorial com query expansion
+    - esparso: apenas BM25
+    - hibrido: denso + expansão + BM25 fundidos via RRF (padrão)
+    """
 
-    if not dense_original:
-        return "Lamentavelmente, não encontrei informações sobre este jogo no manual.", []
+    # ── Montagem das listas de retrieval por modo ─────────────────────────────
+    if mode == "esparso":
+        sparse = search_chunks_bm25(question, game_title, db, limit=10)
+        if not sparse:
+            return "Lamentavelmente, não encontrei informações sobre este jogo no manual.", []
+        # Para o modo esparso puro, converte para o formato esperado pelo pipeline
+        fused_results = [(page, super_clean(content)) for content, page in sparse][:10]
 
-    # 2. Query expansion — 2 variações densas adicionais
-    variations = expand_query(question, game_title)
-    all_ranked_lists = [dense_original]
-    for variation in variations:
-        variation_results = search_chunks_dense(variation, game_title, db, limit=10)
-        if variation_results:
-            all_ranked_lists.append(variation_results)
+    elif mode == "denso":
+        dense = search_chunks_dense(question, game_title, db, limit=10)
+        if not dense:
+            return "Lamentavelmente, não encontrei informações sobre este jogo no manual.", []
+        fused_results = rrf_fusion([dense])[:10]
 
-    # 3. Busca esparsa BM25 — recuperação por palavra-chave exata
-    sparse_results = search_chunks_bm25(question, game_title, db, limit=10)
-    if sparse_results:
-        all_ranked_lists.append(sparse_results)
-
-    # 4. RRF híbrido — funde denso + expansão + esparso, pega top-10
-    fused_results = rrf_fusion(all_ranked_lists)[:10]
+    else:  # hibrido (padrão)
+        dense_original = search_chunks_dense(question, game_title, db, limit=10)
+        if not dense_original:
+            return "Lamentavelmente, não encontrei informações sobre este jogo no manual.", []
+        variations = expand_query(question, game_title)
+        all_lists = [dense_original]
+        for v in variations:
+            vr = search_chunks_dense(v, game_title, db, limit=10)
+            if vr:
+                all_lists.append(vr)
+        sparse = search_chunks_bm25(question, game_title, db, limit=10)
+        if sparse:
+            all_lists.append(sparse)
+        fused_results = rrf_fusion(all_lists)[:10]
 
     if not fused_results:
-        return "Não encontrei trechos relevantes após fusão.", []
+        return "Não encontrei trechos relevantes.", []
 
-    # 5. Reordena por página — preserva ordem pedagógica do manual
+    # ── Reordena por página ───────────────────────────────────────────────────
     fused_results.sort(key=lambda x: x[0])
 
-    # 6. Fontes para o frontend
+    # ── Fontes para o frontend ────────────────────────────────────────────────
     sources = [
         f"[Pág. {page}]: {texto[:150].strip()}..."
         for page, texto in fused_results
     ]
 
-    # 7. Contexto para o LLM
+    # ── Contexto para o LLM ───────────────────────────────────────────────────
     context = "\n\n".join(
         f"[Página {page}]: {texto}"
         for page, texto in fused_results
     )
 
-    # 8. Prompt pedagógico
+    # ── Prompt ────────────────────────────────────────────────────────────────
     system_prompt = (
         "Você é um monitor experiente de {game_title}. Sua missão é explicar as regras "
         "de forma didática, fluida e amigável. Use EXCLUSIVAMENTE os trechos fornecidos.\n\n"
@@ -210,14 +193,13 @@ def get_answer(question: str, game_title: str, db: Session):
     ])
 
     chain = prompt | llm
-
     response = chain.invoke({
         "context": context,
         "question": question,
         "game_title": game_title
     })
 
-    # 9. Adiciona fontes ao final da resposta
+    # ── Fontes no final da resposta ───────────────────────────────────────────
     paginas = []
     for page, _ in fused_results:
         if page not in paginas:
