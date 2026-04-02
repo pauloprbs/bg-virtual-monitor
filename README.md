@@ -203,7 +203,7 @@ Avaliação RAGAS com 20 perguntas agnósticas ao jogo. Faithfulness média: **0
 
 > **Nota sobre Q15 (0.00):** Esta pergunta é de recusa esperada — o manual não menciona expansões. O RAGAS penaliza a resposta porque o ground_truth gerado automaticamente divergiu da resposta de recusa do bot. Casos como Q08, Q10 e Q17 apresentam faithfulness baixo por falso negativo do avaliador: as respostas estão corretas, mas o ground_truth gerado pelo LLM puxou trechos diferentes do corpus.
 
-### Comparativo de avaliadores
+### Comparativo de avaliadores (Brass Birmingham)
 
 | Avaliador | Modelo | Faithfulness média |
 |---|---|---|
@@ -211,6 +211,54 @@ Avaliação RAGAS com 20 perguntas agnósticas ao jogo. Faithfulness média: **0
 | Ollama (local) | Qwen 2.5 3B | 0.4092 |
 
 A diferença entre avaliadores reflete a capacidade do modelo de verificar grounding — modelos menores tendem a ser mais permissivos ou inconsistentes como juízes RAGAS.
+
+### Recall@k — Trilha A (Catan)
+
+| Modo | Recall@3 | Recall@5 | Recall@10 |
+|---|---|---|---|
+| Denso (baseline) | 0.75 (9/12) | 0.75 (9/12) | 0.92 (11/12) |
+| Esparso — BM25 | 0.75 (9/12) | 0.83 (10/12) | 0.83 (10/12) |
+| Híbrido — RRF | 0.67 (8/12) | 0.75 (9/12) | 0.83 (10/12) |
+
+No manual do Catan, o modo Denso atingiu a maior performance isolada no $k=10$. Isso demonstra que a semântica das regras de Catan é bem capturada pelo modelo de embeddings bge-m3, superando a correspondência exata do BM25 em contextos de maior profundidade. O modo híbrido, embora robusto, apresentou uma leve queda no rankeamento inicial ($k=3$), sugerindo que a fusão RRF pode ser refinada para este manual específico.
+
+### Golden Set — Faithfulness por questão (Groq, Catan)
+
+Avaliação RAGAS com 20 perguntas agnósticas ao jogo. Faithfulness média: **0.5670.**.
+
+| ID | Pergunta | Faithfulness |
+|---|---|---|
+| Q01 | Como se consegue a vitória no jogo? | 0.80 ✅ |
+| Q02 | Quantos jogadores podem participar? | 0.60 🟡 |
+| Q03 | O que posso fazer/executar no meu turno? | 0.50 ⚠️ |
+| Q04 | Como termina uma rodada? | 0.40 ⚠️ |
+| Q05 | Como é determinada a ordem dos turnos? | 1.00 ✅ |
+| Q06 | Quais são os componentes incluídos na caixa do jogo? | 0.80 ✅ |
+| Q07 | Para que serve o tabuleiro principal? | 0.50 ⚠️ |
+| Q08 | O que acontece quando um jogador não pode executar uma ação por falta de recursos? | 1.00 ✅ |
+| Q09 | Como a pontuação final é calculada e quais elementos contribuem para ela? | 0.25 ⚠️ |
+| Q10 | Quando posso passar meu turno e o que isso implica? | 0.70 🟡 |
+| Q11 | Como deve ser feita a preparação (setup) inicial dos componentes no tabuleiro? | 0.33 ⚠️ |
+| Q12 | O que acontece quando algum componente limitado do jogo é exaurido? | 1.00 ✅ |
+| Q13 | Existe alguma condição que encerra o jogo antes do fim previsto? | 0.20 ⚠️ |
+| Q14 | O manual oferece alguma dica ou orientação estratégica para os jogadores? | 0.40 ⚠️ |
+| Q15 | Existe alguma expansão oficial para este jogo? | 0.00 ⚠️ |
+| Q16 | Quanto tempo dura uma partida em média? | 0.50 ⚠️ |
+| Q17 | O que acontece se um jogador cometer um erro em uma ação já executada? | 0.40 ⚠️ |
+| Q18 | O que acontece se dois jogadores empatarem na ordem de turno? | 1.00 ✅ |
+| Q19 | Posso executar a mesma ação mais de uma vez no mesmo turno? | 0.06 ⚠️ |
+| Q20 | Quem é declarado vencedor em caso de empate na pontuação final? | 1.00 ✅ |
+
+Nota sobre Faithfulness no Catan: A média de 0.5670 no Catan foi inferior à do Brass (0.7466) devido à natureza mais concisa do manual original, o que gerou fragmentos (chunks) com menor densidade de detalhes técnicos para o avaliador. Q15 e Q19 apresentam scores críticos devido à ausência explícita dessas informações no manual; o bot corretamente recusa ou simplifica, mas o juiz RAGAS penaliza a falta de evidências textuais diretas no ground truth.
+
+### Comparativo de avaliadores (Catan)
+
+| Avaliador | Modelo | Faithfulness média |
+|---|---|---|
+| Groq | Llama 3.1 8B Instant | **0.5670** |
+| Ollama (local) | Qwen 2.5 3B | 0.4000 |
+
+A análise comparativa reforça que modelos maiores em nuvem (Groq) conseguem realizar uma verificação de grounding muito mais rigorosa. O Qwen 2.5 3B local apresenta uma tendência a ser excessivamente crítico ou inconsistente na atribuição de notas de fidelidade, resultando em um score de 0.40. Para fins de entrega final, os dados do Groq são considerados a base de verdade do projeto.
 
 ---
 
